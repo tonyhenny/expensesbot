@@ -39,6 +39,7 @@ python bot.py
 - `/recent` - последние расходы
 - `/categories` - список категорий
 - `/addcategory` - добавить категорию
+- `/pro` - купить Pro навсегда за Telegram Stars
 - `/help` - помощь
 
 База создаётся рядом с файлом: `expenses.sqlite3`.

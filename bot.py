@@ -15,12 +15,14 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, Message, PreCheckoutQuery
 
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "expenses.sqlite3"
 ENV_PATH = BASE_DIR / ".env"
+PRO_PRICE_STARS = 1
+PRO_PAYLOAD_PREFIX = "pro_forever"
 
 DEFAULT_CATEGORIES = [
     ("🍔", "Еда"),
@@ -112,6 +114,13 @@ def init_db() -> None:
                 category_id INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(category_id) REFERENCES categories(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS pro_subscriptions (
+                user_id INTEGER PRIMARY KEY,
+                activated_at TEXT NOT NULL,
+                telegram_payment_charge_id TEXT,
+                provider_payment_charge_id TEXT
             );
             """
         )
@@ -255,6 +264,44 @@ def delete_last_expense(user_id: int) -> sqlite3.Row | None:
         return row
 
 
+def is_pro(user_id: int) -> bool:
+    with connect_db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM pro_subscriptions WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    return row is not None
+
+
+def activate_pro(
+    user_id: int,
+    telegram_payment_charge_id: str | None,
+    provider_payment_charge_id: str | None,
+) -> None:
+    with connect_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO pro_subscriptions(
+                user_id,
+                activated_at,
+                telegram_payment_charge_id,
+                provider_payment_charge_id
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                activated_at = excluded.activated_at,
+                telegram_payment_charge_id = excluded.telegram_payment_charge_id,
+                provider_payment_charge_id = excluded.provider_payment_charge_id
+            """,
+            (
+                user_id,
+                datetime.now().isoformat(timespec="seconds"),
+                telegram_payment_charge_id,
+                provider_payment_charge_id,
+            ),
+        )
+
+
 def parse_expense(text: str) -> tuple[str, int] | None:
     match = EXPENSE_RE.match(text)
     if not match:
@@ -297,19 +344,45 @@ def categories_keyboard(user_id: int, pending_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def main_keyboard() -> InlineKeyboardMarkup:
+def main_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="📊 Сегодня", callback_data="stats:today"),
+            InlineKeyboardButton(text="📅 Месяц", callback_data="stats:month"),
+        ],
+        [
+            InlineKeyboardButton(text="🧾 Последние", callback_data="recent"),
+            InlineKeyboardButton(text="🏷 Категории", callback_data="categories"),
+        ],
+        [InlineKeyboardButton(text="➕ Категория", callback_data="add_category")],
+    ]
+
+    if user_id is not None and not is_pro(user_id):
+        rows.append([InlineKeyboardButton(text="⭐ Pro навсегда", callback_data="pro")])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def pro_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    if is_pro(user_id):
+        return main_keyboard(user_id)
+
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📊 Сегодня", callback_data="stats:today"),
-                InlineKeyboardButton(text="📅 Месяц", callback_data="stats:month"),
-            ],
-            [
-                InlineKeyboardButton(text="🧾 Последние", callback_data="recent"),
-                InlineKeyboardButton(text="🏷 Категории", callback_data="categories"),
-            ],
-            [InlineKeyboardButton(text="➕ Категория", callback_data="add_category")],
+            [InlineKeyboardButton(text=f"⭐ Купить за {PRO_PRICE_STARS} XTR", callback_data="buy_pro")],
+            [InlineKeyboardButton(text="🏠 Меню", callback_data="menu")],
         ]
+    )
+
+
+def pro_text(user_id: int) -> str:
+    if is_pro(user_id):
+        return "Pro уже активирован навсегда."
+
+    return (
+        "Pro навсегда\n\n"
+        f"Цена: {PRO_PRICE_STARS} ⭐\n"
+        "Платные функции добавим позже. Сейчас покупка просто включает Pro-статус."
     )
 
 
@@ -387,7 +460,7 @@ async def start(message: Message) -> None:
     await message.answer(
         "Пиши расход так: кофе 300\n"
         "Я спрошу категорию и сохраню в SQLite.",
-        reply_markup=main_keyboard(),
+        reply_markup=main_keyboard(message.from_user.id),
     )
 
 
@@ -399,19 +472,20 @@ async def help_command(message: Message) -> None:
         "/stats - статистика\n"
         "/recent - последние расходы\n"
         "/categories - категории\n"
-        "/addcategory - добавить категорию",
-        reply_markup=main_keyboard(),
+        "/addcategory - добавить категорию\n"
+        "/pro - подписка Pro",
+        reply_markup=main_keyboard(message.from_user.id),
     )
 
 
 @router.message(Command("stats"))
 async def stats_command(message: Message) -> None:
-    await message.answer(stats_text(message.from_user.id, "today"), reply_markup=main_keyboard())
+    await message.answer(stats_text(message.from_user.id, "today"), reply_markup=main_keyboard(message.from_user.id))
 
 
 @router.message(Command("categories"))
 async def categories_command(message: Message) -> None:
-    await message.answer(categories_text(message.from_user.id), reply_markup=main_keyboard())
+    await message.answer(categories_text(message.from_user.id), reply_markup=main_keyboard(message.from_user.id))
 
 
 @router.message(Command("recent"))
@@ -426,22 +500,33 @@ async def add_category_command(message: Message, state: FSMContext) -> None:
     await message.answer("Напиши новую категорию. Например: 🚕 Такси")
 
 
+@router.message(Command("pro"))
+async def pro_command(message: Message) -> None:
+    await message.answer(pro_text(message.from_user.id), reply_markup=pro_keyboard(message.from_user.id))
+
+
 @router.callback_query(F.data == "menu")
 async def menu_callback(callback: CallbackQuery) -> None:
-    await callback.message.edit_text("Меню", reply_markup=main_keyboard())
+    await callback.message.edit_text("Меню", reply_markup=main_keyboard(callback.from_user.id))
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("stats:"))
 async def stats_callback(callback: CallbackQuery) -> None:
     period = callback.data.split(":", 1)[1]
-    await callback.message.edit_text(stats_text(callback.from_user.id, period), reply_markup=main_keyboard())
+    await callback.message.edit_text(
+        stats_text(callback.from_user.id, period),
+        reply_markup=main_keyboard(callback.from_user.id),
+    )
     await callback.answer()
 
 
 @router.callback_query(F.data == "categories")
 async def categories_callback(callback: CallbackQuery) -> None:
-    await callback.message.edit_text(categories_text(callback.from_user.id), reply_markup=main_keyboard())
+    await callback.message.edit_text(
+        categories_text(callback.from_user.id),
+        reply_markup=main_keyboard(callback.from_user.id),
+    )
     await callback.answer()
 
 
@@ -461,7 +546,7 @@ async def delete_last_callback(callback: CallbackQuery) -> None:
 
     await callback.message.edit_text(
         f"Удалил: {deleted['title']} — {money(deleted['amount_cents'])}",
-        reply_markup=main_keyboard(),
+        reply_markup=main_keyboard(callback.from_user.id),
     )
     await callback.answer("Удалено")
 
@@ -472,6 +557,71 @@ async def add_category_callback(callback: CallbackQuery, state: FSMContext) -> N
     await state.update_data(pending_id=None)
     await callback.message.edit_text("Напиши новую категорию. Например: 🚕 Такси")
     await callback.answer()
+
+
+@router.callback_query(F.data == "pro")
+async def pro_callback(callback: CallbackQuery) -> None:
+    await callback.message.edit_text(
+        pro_text(callback.from_user.id),
+        reply_markup=pro_keyboard(callback.from_user.id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "buy_pro")
+async def buy_pro_callback(callback: CallbackQuery) -> None:
+    if is_pro(callback.from_user.id):
+        await callback.message.edit_text(
+            "Pro уже активирован навсегда.",
+            reply_markup=main_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+        return
+
+    await callback.message.answer_invoice(
+        title="Pro навсегда",
+        description="Единоразовая подписка Pro в этом боте.",
+        payload=f"{PRO_PAYLOAD_PREFIX}:{callback.from_user.id}",
+        provider_token="",
+        currency="XTR",
+        prices=[LabeledPrice(label="Pro навсегда", amount=PRO_PRICE_STARS)],
+    )
+    await callback.answer()
+
+
+@router.pre_checkout_query()
+async def pro_pre_checkout(query: PreCheckoutQuery) -> None:
+    expected_payload = f"{PRO_PAYLOAD_PREFIX}:{query.from_user.id}"
+
+    if query.invoice_payload != expected_payload:
+        await query.answer(ok=False, error_message="Некорректный платеж.")
+        return
+
+    if is_pro(query.from_user.id):
+        await query.answer(ok=False, error_message="Pro уже активирован.")
+        return
+
+    await query.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def successful_payment(message: Message) -> None:
+    payment = message.successful_payment
+    expected_payload = f"{PRO_PAYLOAD_PREFIX}:{message.from_user.id}"
+
+    if payment.invoice_payload != expected_payload or payment.currency != "XTR":
+        await message.answer("Платеж получен, но не похож на Pro. Напиши разработчику.")
+        return
+
+    activate_pro(
+        message.from_user.id,
+        payment.telegram_payment_charge_id,
+        payment.provider_payment_charge_id,
+    )
+    await message.answer(
+        "Pro активирован навсегда.",
+        reply_markup=main_keyboard(message.from_user.id),
+    )
 
 
 @router.callback_query(F.data.startswith("cat:"))
@@ -485,7 +635,7 @@ async def category_callback(callback: CallbackQuery) -> None:
 
     await callback.message.edit_text(
         f"Сохранил: {pending['title']} — {money(pending['amount_cents'])}",
-        reply_markup=main_keyboard(),
+        reply_markup=main_keyboard(callback.from_user.id),
     )
     await callback.answer("Готово")
 
@@ -512,7 +662,7 @@ async def custom_category_callback(callback: CallbackQuery, state: FSMContext) -
 async def cancel_callback(callback: CallbackQuery) -> None:
     pending_id = int(callback.data.split(":", 1)[1])
     if cancel_pending(callback.from_user.id, pending_id):
-        await callback.message.edit_text("Ок, не сохраняю.", reply_markup=main_keyboard())
+        await callback.message.edit_text("Ок, не сохраняю.", reply_markup=main_keyboard(callback.from_user.id))
     else:
         await callback.answer("Расход не найден", show_alert=True)
         return
@@ -527,7 +677,7 @@ async def custom_category_name(message: Message, state: FSMContext) -> None:
 
     if pending_id is None:
         await state.clear()
-        await message.answer(f"Добавил категорию: {category.label}", reply_markup=main_keyboard())
+        await message.answer(f"Добавил категорию: {category.label}", reply_markup=main_keyboard(message.from_user.id))
         return
 
     pending = save_expense(message.from_user.id, int(pending_id), category.id)
@@ -540,7 +690,7 @@ async def custom_category_name(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"Сохранил: {pending['title']} — {money(pending['amount_cents'])}\n"
         f"Категория: {category.label}",
-        reply_markup=main_keyboard(),
+        reply_markup=main_keyboard(message.from_user.id),
     )
 
 
