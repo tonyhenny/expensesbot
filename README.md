@@ -40,6 +40,13 @@ python bot.py
 - `/categories` - список категорий
 - `/addcategory` - добавить категорию
 - `/pro` - купить Pro навсегда за Telegram Stars
+- `/export` - экспорт CSV/XLSX/JSON для Pro
+- `/limits` - лимиты по категориям для Pro
+- `/limit Кофе 3000` - задать месячный лимит для Pro
+- `/search кофе` - поиск расходов для Pro
+- `/month` - месячный отчёт для Pro
+- `/recurring` - повторяющиеся расходы для Pro
+- `/stoprepeat 1` - остановить повтор для Pro
 - `/help` - помощь
 
 База создаётся рядом с файлом: `expenses.sqlite3`.
